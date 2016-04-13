@@ -11,6 +11,9 @@ describe('ssh-job', function() {
         SshJob,
         sshJob;
 
+    var commandUtil = {};
+    function CommandUtil() { return commandUtil; }
+
     function sshMockGet(eventList, error) {
         var mockSsh = new Emitter();
         mockSsh.events = new Emitter();
@@ -39,10 +42,11 @@ describe('ssh-job', function() {
     before(function() {
         helper.setupInjector([
             helper.require('/lib/jobs/ssh-job.js'),
+            helper.require('/lib/jobs/base-job.js'),
+            helper.di.simpleWrapper(CommandUtil, 'JobUtils.Commands'),
             helper.di.simpleWrapper(mockParser, 'JobUtils.CommandParser'),
             helper.di.simpleWrapper(mockEncryption, 'Services.Encryption'),
             helper.di.simpleWrapper({Client:function(){}}, 'ssh'),
-            helper.require('/lib/jobs/base-job.js'),
             helper.di.simpleWrapper(waterline, 'Services.Waterline')
         ]);
         this.sandbox = sinon.sandbox.create();
@@ -50,18 +54,26 @@ describe('ssh-job', function() {
     });
 
     describe('_run', function() {
-        var sshSettings;
-        beforeEach(function() {
+        var sshSettings,
+            testCommands;
+
+        before(function() {
+            testCommands = [
+                {cmd: 'aCommand', source: 'test'},
+                {cmd: 'testCommand'}
+            ];
+            commandUtil.buildCommands = this.sandbox.stub().returns(testCommands);
             sshJob = new SshJob({}, { target: 'someNodeId' }, uuid.v4());
             waterline.nodes.needByIdentifier = this.sandbox.stub();
             this.sandbox.stub(sshJob, 'sshExec').resolves();
-            this.sandbox.stub(sshJob, 'handleResponse').resolves();
+            mockParser.parseTasks = this.sandbox.stub().resolves();
+            mockParser.parseUnknownTasks = this.sandbox.stub().resolves();
             sshSettings = {
                 host: 'the remote host',
                 port: 22,
                 username: 'someUsername',
                 password: 'somePassword',
-                privateKey: 'a pretty long, encrypted string',
+                privateKey: 'a pretty long string',
             };
         });
 
@@ -71,24 +83,35 @@ describe('ssh-job', function() {
 
         it('should execute the given remote commands using credentials'+
         ' from a node and handle the responses', function() {
-            sshJob.commands = [
-                {command: 'aCommand', catalogOptions: { source: 'test' }},
-                {command: 'testCommand'}
-            ];
+            commandUtil.parseResponse = this.sandbox.stub().resolves([
+                    {data:'data', source: 'aCommand'},
+                    {data:'more data', source: 'testCommand'}
+            ]);
+            commandUtil.catalogParsedTasks = this.sandbox.stub().resolves(
+            [{data:'data', source: 'test'}]
+            );
+
             var node = { sshSettings: sshSettings };
             waterline.nodes.needByIdentifier.resolves(node);
-            sshJob.sshExec.onCall(0).resolves({});
-            sshJob.sshExec.onCall(1).resolves({});
+            sshJob.sshExec.onCall(0).resolves({stdout: 'data', cmd: 'aCommand'});
+            sshJob.sshExec.onCall(1).resolves({stdout: 'more data', cmd: 'testCommand'});
+            sshJob.commands = testCommands;
+
             return sshJob._run()
             .then(function() {
-                expect(sshJob.sshExec).to.have.been.calledTwice;
-                expect(sshJob.sshExec).to.have.been.calledWith('aCommand', sshSettings);
-                expect(sshJob.sshExec).to.have.been.calledWith('testCommand', sshSettings);
-                expect(sshJob.handleResponse).to.have.been.calledOnce;
-                expect(sshJob.handleResponse).to.have.been.calledWith([
-                    {cmd: 'aCommand', catalogOptions: { source: 'test'}},
-                    {cmd: 'testCommand', catalogOptions: undefined }
-                ]);
+                expect(sshJob.sshExec).to.have.been.calledTwice
+                    .and.calledWith(sshJob.commands[0], sshSettings)
+                    .and.calledWith(sshJob.commands[1], sshSettings);
+                expect(commandUtil.parseResponse).to.have.been.calledOnce
+                    .and.calledWith([
+                        {stdout: 'data', cmd: 'aCommand'},
+                        {stdout: 'more data', cmd: 'testCommand'}
+                    ]);
+                expect(commandUtil.catalogParsedTasks).to.have.been.calledOnce
+                    .and.calledWith(
+                        {data: 'data', source: 'aCommand'},
+                        {data: 'more data', source: 'testCommand'}
+                    );
             });
         });
     });
@@ -97,16 +120,16 @@ describe('ssh-job', function() {
         var sshSettings,
             testCmd;
 
-
         beforeEach(function() {
             sshJob = new SshJob({}, { target: 'someNodeId' }, uuid.v4());
             mockEncryption.decrypt = this.sandbox.stub();
+            testCmd = {cmd: 'doStuff'};
             sshSettings = {
                 host: 'the remote host',
                 port: 22,
                 username: 'someUsername',
                 password: 'somePassword',
-                privateKey: 'a pretty long, encrypted string',
+                privateKey: 'a pretty long string',
             };
         });
 
@@ -147,7 +170,30 @@ describe('ssh-job', function() {
             });
         });
 
-        it('should reject if underlying ssh returns an error', function() {
+        it('should time out if given the option', function() {
+            var mockClient = sshMockGet();
+            testCmd.timeout = 10;
+            mockClient.connect = function() {
+                return Promise.delay(20);
+            };
+
+            return expect(sshJob.sshExec(testCmd, sshSettings, mockClient)).to
+                .be.rejectedWith(/timed out/);
+        });
+
+        it('should reject on ssh error events', function() {
+            var error = new Error('ssh error');
+            error.level = 'client-ssh'; //may also be 'client-socket'
+
+            var mockClient = sshMockGet();
+            mockClient.connect = function() {
+                this.emit('error', error);
+            };
+            return expect(sshJob.sshExec(testCmd, sshSettings, mockClient)).to
+                .be.rejectedWith(/ssh error/);
+        });
+
+        it('should reject if underlying ssh returns a remote error', function() {
             var mockClient = sshMockGet(
                 [{ event: 'close', data: 0 }],
                 new Error('ssh error')
@@ -158,126 +204,4 @@ describe('ssh-job', function() {
         });
     });
 
-    describe('catalogUserTasks', function() {
-        var catalogableTask, errTask, unmarkedTask, tasksOutput;
-
-        beforeEach(function() {
-            sshJob = new SshJob({}, { target: 'someNodeId' }, uuid.v4());
-            mockParser.parseTasks = this.sandbox.stub().resolves();
-            waterline.catalogs.create = this.sandbox.stub();
-            catalogableTask = function() {
-                return { data: 'catalog me!', store: true, source: 'test' };
-            };
-            errTask = function() {
-               return { error: new Error('parse failure'), source: 'test' };
-            };
-            unmarkedTask = function() {
-                return { data: 'don\'t catalog me!', source: 'test' };
-            };
-            tasksOutput = [{ stdout: 'some arbitrary parseable data' }];
-        });
-
-        afterEach(function() {
-            this.sandbox.restore();
-        });
-
-        it('should use the command parser to parse and array of tasks and'+
-            'return a Promise for catalogging them', function() {
-            mockParser.parseTasks.resolves([catalogableTask(), catalogableTask()]);
-            return sshJob.catalogUserTasks(tasksOutput)
-            .then(function() {
-                expect(waterline.catalogs.create).to.have.been.calledTwice;
-            });
-        });
-
-        it('should catalog only marked tasks', function() {
-            mockParser.parseTasks.resolves([catalogableTask(), unmarkedTask()]);
-            return sshJob.catalogUserTasks(tasksOutput)
-            .then(function() {
-                expect(waterline.catalogs.create).to.have.been.calledOnce;
-            });
-        });
-
-        it('should not catalog tasks that could not be parsed', function() {
-            mockParser.parseTasks.resolves([catalogableTask(), errTask()]);
-            return sshJob.catalogUserTasks(tasksOutput)
-            .then(function() {
-                expect(waterline.catalogs.create).to.have.been.calledOnce;
-            });
-        });
-    });
-
-    describe('handleResponse', function() {
-        var testResponse;
-
-        beforeEach(function() {
-            sshJob = new SshJob({}, { target: 'someNodeId' }, uuid.v4());
-            this.sandbox.stub(sshJob, 'catalogUserTasks').resolves();
-            testResponse = [
-                { data: 'data', catalogOptions: { source: 'test' } },
-                { data: 'data' },
-                { data: 'data', catalogOptions: undefined }
-            ];
-        });
-
-        afterEach(function() {
-            this.sandbox.restore();
-        });
-
-        it('should filter an array of objects by "catalogOptions" key'+
-            ' to feed to catalogUserTasks', function() {
-
-            return sshJob.handleResponse(testResponse)
-            .then(function() {
-                expect(sshJob.catalogUserTasks).to.have.been.calledOnce;
-                expect(sshJob.catalogUserTasks).to.have.been
-                    .calledWithExactly([testResponse[0]]);
-            });
-        });
-
-        it('should catch and bubble up errors in the parsing/catalogging'+
-            ' process', function() {
-            var err = new Error('catalog error');
-            sshJob.catalogUserTasks.rejects(err);
-            return expect(sshJob.handleResponse(testResponse)).to.be.rejectedWith(err);
-        });
-    });
-
-    describe('buildCommands', function() {
-        var commandObject;
-
-        beforeEach(function() {
-            sshJob = new SshJob({}, { target: 'someNodeId' }, uuid.v4());
-            commandObject = {
-                    command: 'command',
-                    retries: 3,
-                    catalog: { format: 'json', source: 'test' }
-                };
-        });
-        it('should return an array of command objects from '+
-            'an array of input objects and/or strings', function() {
-            var commands = ['stringCommand', commandObject ];
-
-            expect(sshJob.buildCommands(commands)).to.deep.equal([
-                { command: 'stringCommand' },
-                {
-                    command: 'command', retries: 3,
-                    catalogOptions: { source: 'test', format: 'json' }
-                }
-            ]);
-        });
-
-        it('should err on unsupported options', function() {
-            var commands = _.map(['downloadUrl', 'acceptedResponseCodes', 'junk'],
-            function(option) {
-                var optObj = _.cloneDeep(commandObject);
-                optObj[option] = 'someUnsupportedOptionData';
-                return optObj;
-            });
-            _.forEach(commands, function(command) {
-                expect(sshJob.buildCommands.bind(sshJob, command)).to
-                .throw(/not supported/);
-            });
-        });
-    });
 });
