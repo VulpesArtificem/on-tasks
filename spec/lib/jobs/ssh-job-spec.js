@@ -48,6 +48,8 @@ describe('ssh-job', function() {
                 password: 'somePassword',
                 privateKey: 'a pretty long string',
             };
+
+            expect(sshJob).to.have.property('commandUtil');
         });
 
         afterEach(function() {
